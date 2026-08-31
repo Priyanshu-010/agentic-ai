@@ -182,3 +182,184 @@ while True:
   })
 
   print(f"Assistant : {result['messages'][-1].content}")
+
+
+# Explanation of the code and topic
+  """
+  AI answer: 
+
+
+Here's the full picture, explained as if you're seeing it for the first time:
+
+The Big Idea
+You're building a college chatbot that:
+
+Knows which programme (BCA/BBA/B.Com) the student is in
+Routes questions to the right knowledge source (academic handbook PDF, fee structure PDF, or general LLM knowledge)
+Answers using only relevant info
+LangGraph is the framework that lets you define this as a directed graph of nodes — each node is a step, edges are the flow between them.
+
+The Imports (what each library does)
+from langgraph.graph.message import add_messages  # reducer that APPENDS to the messages list
+from langgraph.graph import StateGraph, START, END  # the graph builder + special entry/exit points
+from langchain_groq import ChatGroq               # LLM client (hosted on Groq's API)
+from langchain_community.document_loaders import PyPDFLoader  # reads a PDF into text
+from langchain_text_splitters import RecursiveCharacterTextSplitter  # cuts text into chunks
+from langchain_huggingface import HuggingFaceEmbeddings  # converts text → numeric vectors
+from langchain_community.vectorstores import FAISS  # vector database (stores & searches vectors)
+from dotenv import load_dotenv                    # loads API keys from a .env file
+
+You don't need to memorize these. Just know each one does one job in the RAG pipeline.
+
+STEP 1 — Building the RAG Retriever
+This is the "brain" that answers questions from your PDFs. It has 4 sub-steps:
+
+PDF → Load → Split → Embed → Store in FAISS → (later) Search
+
+embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+This downloads a small model that turns any text into a vector (a list of ~384 numbers). Text with similar meaning gets similar vectors. This is the key trick that makes "semantic search" possible.
+
+def build_retriver(pdf_path: str):
+    loader = PyPDFLoader(pdf_path)
+    document = loader.load()
+
+Reads the PDF and gives you a list of "documents" (each page or section as a text block).
+
+    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+    chunks = splitter.split_documents(document)
+
+Splits the text into ~800-character pieces, with 100 characters of overlap between consecutive chunks. Why overlap? So a sentence that straddles a chunk boundary isn't lost.
+
+    vectorstore = FAISS.from_documents(chunks, embeddings)
+    return vectorstore.as_retriever(search_kwargs={"k": 4})
+
+FAISS.from_documents → converts every chunk into a vector using the embedding model and stores them in an in-memory index.
+.as_retriever(search_kwargs={"k": 4}) → gives you a callable that, when you pass it a query string, returns the top 4 most similar chunks.
+So academic_retriever and fee_retriever are just two search engines, one per PDF.
+
+llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.5)
+
+Your LLM. temperature=0.5 means "slightly creative but mostly factual" — good for a chatbot that should be accurate.
+
+STEP 2 — The State
+class State(TypedDict):
+    programme: str
+    messages: Annotated[list, add_messages]
+    query_type: str
+    retrieved_context: str
+
+This is a shared blackboard that every node can read from and write to. Think of it as a global variable that LangGraph manages for you.
+
+Key	What it holds	Who writes it
+programme	"BCA" / "BBA" / "B.Com (H)"	Set once at the start
+messages	Full conversation history	add_messages reducer appends new ones
+query_type	"academic" / "fee" / "general"	classifier_node
+retrieved_context	Chunks from PDF (or sentinel)	the RAG nodes
+
+The Annotated[list, add_messages] part is important: it tells LangGraph to append to the list instead of replacing it. Without that, every new message would wipe the old ones.
+
+STEP 3 — The Nodes (each is one "step" in the pipeline)
+classifier_node
+Reads the latest user message
+Asks the LLM: "Is this academic, fee, or general?"
+Returns {"query_type": "academic"} (or whichever)
+LangGraph merges that into state automatically
+academic_rag_node / fee_rag_node
+No LLM call. Just queries the FAISS index.
+Returns the top-4 chunks joined into one string → stored in retrieved_context
+general_node
+No retrieval. Returns the flag "NO_RETRIEVAL_NEEDED" so the next node knows to skip context.
+response_node (the actual answerer)
+This is where the LLM actually generates the reply:
+
+If retrieved_context is the sentinel → prompt the LLM with no context (general knowledge)
+Otherwise → stuff the retrieved chunks into the prompt as "Context:" and ask the LLM to answer based on them
+Returns {"messages": [("ai", response.content)]} → this gets appended to the conversation history by the add_messages reducer
+STEP 4 — The Router
+def route_query(state: State):
+    if state['query_type'] == "academic":
+        return "academic_rag"
+    elif state['query_type'] == "fee":
+        return "fee_rag"
+    else:
+        return "general"
+
+This is a pure function — no side effects. It just looks at the state and returns the name of the next node to visit. LangGraph uses that string to decide which edge to follow.
+
+STEP 5 — Wiring the Graph
+graph = StateGraph(State)
+
+graph.add_node("classifier", classifier_node)
+graph.add_node("academic_rag", academic_rag_node)
+graph.add_node("fee_rag", fee_rag_node)
+graph.add_node("general", general_node)
+graph.add_node("response", response_node)
+
+Register all 5 nodes. The first argument is the name (used in edges), the second is the function.
+
+graph.add_edge(START, "classifier")
+
+Entry point → always go to classifier first.
+
+graph.add_conditional_edges("classifier", route_query)
+
+After classifier, don't go to a fixed node — ask route_query which one to pick. The return value of that function must match a registered node name.
+
+graph.add_edge("academic_rag", "response")
+graph.add_edge("fee_rag", "response")
+graph.add_edge("general", "response")
+
+All three paths converge into the same response node.
+
+graph.add_edge("response", END)
+
+After answering, stop.
+
+The resulting graph looks like:
+
+START → classifier ──┬── academic_rag ──┐
+                      ├── fee_rag ───────┼──→ response → END
+                      └── general ───────┘
+
+app = graph.compile()
+
+compile() validates the graph (checks all edges point to real nodes, etc.) and produces a callable object you can invoke.
+
+STEP 6 — Running It
+while True:
+    user_query = input("You:  ")
+    if user_query.lower() in ["exit", "quit"]:
+        break
+
+    result = app.invoke({
+        "programme": student_programme,
+        "messages": [("human", user_query)]
+    })
+
+    print(f"Assistant: {result['messages'][-1].content}")
+
+Each call to app.invoke(...):
+
+Takes the input dict (programme + new human message)
+Runs the graph: classifier → RAG node → response
+Returns the final state — you grab the last message (the AI's reply)
+One thing to note: each invoke call is stateless from LangGraph's perspective. The messages list you pass in only contains the current turn, not the full history. If you want multi-turn memory, you'd need to either:
+
+Pass the full messages history each time, or
+Use LangGraph's checkpointer (a built-in memory mechanism)
+For a simple demo, what you have works fine.
+
+TL;DR — The Data Flow
+User types "What's the late fee for BCA?"
+        ↓
+classifier_node: LLM says "fee"
+        ↓
+fee_rag_node: searches fee_structure.pdf → gets 4 relevant chunks
+        ↓
+response_node: LLM sees chunks + "you're a BCA student" → generates answer
+        ↓
+END → you print the answer
+
+That's the entire system. Each node does exactly one job, the state is the shared context, and the graph defines the order. That's all LangGraph is at its core.
+  """
